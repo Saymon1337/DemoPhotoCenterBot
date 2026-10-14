@@ -15,7 +15,7 @@ from database.queries import (
     create_order, add_order_item, create_booking, 
     get_staff_and_owner_ids, save_order_message,
     get_user_profile, save_user_profile, get_user_role,
-    get_text, is_promo_active
+    get_text, is_promo_active, get_button_aliases
 )
 from keyboards.client_kb import (
     get_main_menu_kb, get_photo_sizes_kb, get_doc_format_kb,
@@ -40,7 +40,7 @@ async def get_current_cms_texts() -> dict:
     keys = ['btn_photo', 'btn_docs', 'btn_booking', 'btn_cart', 'btn_my_orders', 'msg_welcome', 'msg_broadcast_title']
     return {k: await get_text(k) for k in keys}
 
-# НАДЕЖНЫЙ СТАРТ ДЛЯ ВСЕХ РОЛЕЙ
+# Старт
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     try:
@@ -50,24 +50,17 @@ async def cmd_start(message: Message, state: FSMContext):
         role = await get_user_role(uid)
         is_owner = (uid == OWNER_ID or role == 'owner')
 
-        # Если пишет Владелец или Сотрудник — открываем рабочую панель
         if is_owner or role == 'staff':
             safe_name = html.escape(message.from_user.first_name or "Коллега")
             role_label = "Владелец" if is_owner else "Сотрудник"
-            await message.answer(
-                f"👑 <b>Рабочий кабинет: {role_label}</b>\n\nЗдравствуйте, <b>{safe_name}</b>!",
-                reply_markup=get_admin_reply_kb(),
-                parse_mode="HTML"
-            )
+            await message.answer(f"👑 <b>Рабочий кабинет: {role_label}</b>\n\nЗдравствуйте, <b>{safe_name}</b>!", reply_markup=get_admin_reply_kb(), parse_mode="HTML")
             try:
                 kb = get_admin_main_kb(is_owner=is_owner)
             except TypeError:
                 kb = get_admin_main_kb()
-                
             await message.answer("🛠 <b>Панель управления фотоцентра</b>\nВыберите действие:", reply_markup=kb, parse_mode="HTML")
             return
 
-        # Если пишет обычный Клиент
         cms = await get_current_cms_texts()
         safe_name = html.escape(message.from_user.first_name or "Гость")
         welcome_text = cms.get('msg_welcome') or 'Добро пожаловать в цифровой фотоцентр! Выберите нужную услугу:'
@@ -76,31 +69,65 @@ async def cmd_start(message: Message, state: FSMContext):
         logger.exception(f"Ошибка в cmd_start: {e}")
         await message.answer(f"❌ Ошибка запуска: {e}")
 
-# РОУТЕР КНОПОК МЕНЮ: РАБОТАЕТ ТОЛЬКО ЕСЛИ НЕТ АКТИВНОГО ВВОДА ТЕКСТА (StateFilter(None))!
+# САМОИСЦЕЛЯЮЩИЙСЯ РОУТЕР КНОПОК МЕНЮ
 @router.message(StateFilter(None), F.text)
 async def dynamic_client_menu_router(message: Message, state: FSMContext):
-    cms = await get_current_cms_texts()
     txt = message.text.strip()
-    
-    # Служебная кнопка админов
-    if txt == "🛠 Панель управления":
+    txt_lower = txt.lower()
+
+    # 0. Служебная кнопка админов
+    if txt == "🛠 Панель управления" or "панель управления" in txt_lower:
         from handlers.admin import cmd_admin
         await cmd_admin(message)
         return
 
-    # Клиентские кнопки
-    if txt == cms.get('btn_photo', '📸 Печать фотографий'):
+    cms = await get_current_cms_texts()
+
+    # Получаем ВСЮ ИСТОРИЮ названий для каждой кнопки (текущие + прошлые изменения)
+    photo_aliases = await get_button_aliases('btn_photo', default="📸 Печать фотографий")
+    docs_aliases = await get_button_aliases('btn_docs', default="📄 Печать документов")
+    booking_aliases = await get_button_aliases('btn_booking', default="📅 Запись на фото на документы")
+    cart_aliases = await get_button_aliases('btn_cart', default="🛒 Мой заказ / Корзина")
+    orders_aliases = await get_button_aliases('btn_my_orders', default="📋 Мои записи и заказы")
+
+    # Функция автообновления кнопок на экране клиента, если нажата старая кнопка
+    async def refresh_keyboard_if_outdated(current_btn_key: str):
+        current_name = cms.get(current_btn_key)
+        if current_name and txt != current_name:
+            # На лету обновляем клавиатуру на телефоне клиента на актуальную из CMS!
+            await message.answer("🔄 <i>Меню обновлено до актуального состояния.</i>", reply_markup=get_main_menu_kb(cms), parse_mode="HTML")
+
+    # 1. Фотопечать (сработает при ЛЮБОМ старом или новом названии кнопки)
+    if txt in photo_aliases or any(a.lower() == txt_lower for a in photo_aliases) or "фото" in txt_lower:
+        await refresh_keyboard_if_outdated('btn_photo')
         await choose_photo_size(message)
-    elif txt == cms.get('btn_docs', '📄 Печать документов'):
+        return
+
+    # 2. Печать документов
+    if txt in docs_aliases or any(a.lower() == txt_lower for a in docs_aliases) or "документ" in txt_lower:
+        await refresh_keyboard_if_outdated('btn_docs')
         await choose_doc_format(message)
-    elif txt == cms.get('btn_booking', '📅 Запись на фото на документы'):
+        return
+
+    # 3. Запись на фото
+    if txt in booking_aliases or any(a.lower() == txt_lower for a in booking_aliases) or "запись" in txt_lower:
+        await refresh_keyboard_if_outdated('btn_booking')
         from handlers.booking import start_booking
         await start_booking(message)
-    elif txt == cms.get('btn_cart', '🛒 Мой заказ / Корзина'):
+        return
+
+    # 4. Корзина
+    if txt in cart_aliases or any(a.lower() == txt_lower for a in cart_aliases) or "корзин" in txt_lower or (txt_lower.startswith("заказ") and "мои" not in txt_lower):
+        await refresh_keyboard_if_outdated('btn_cart')
         await view_cart_cmd(message, state)
-    elif txt == cms.get('btn_my_orders', '📋 Мои записи и заказы'):
+        return
+
+    # 5. Мои заказы
+    if txt in orders_aliases or any(a.lower() == txt_lower for a in orders_aliases) or "мои записи" in txt_lower or "мои заказы" in txt_lower:
+        await refresh_keyboard_if_outdated('btn_my_orders')
         from handlers.booking import view_client_bookings_and_orders
         await view_client_bookings_and_orders(message)
+        return
 
 @router.callback_query(F.data == "back_to_menu")
 async def back_menu(callback: CallbackQuery, state: FSMContext):
@@ -115,22 +142,31 @@ async def back_menu(callback: CallbackQuery, state: FSMContext):
 
 # Печать фото
 async def choose_photo_size(message: Message):
-    prices = await get_all_prices()
-    p = {x['service_code']: x for x in prices if 'photo_' in x['service_code']}
+    try:
+        prices = await get_all_prices()
+        p = [x for x in prices if x.get('service_code', '').startswith('photo_') and 'doc' not in x.get('service_code', '')]
 
-    lines = ["📸 <b>Печать фотографий на фотобумаге</b>\n\nТарифы:"]
-    for code, item in p.items():
-        if is_promo_active(item):
-            try:
-                d_fmt = datetime.strptime(item['promo_until'], "%Y-%m-%d").strftime("%d.%m")
-            except Exception:
-                d_fmt = item['promo_until']
-            lines.append(f"• {html.escape(item['name'])}: 🔥 <b>АКЦИЯ до {d_fmt}: {item['promo_price']} ₽</b> <s>(вместо {item['price']} ₽)</s>")
+        lines = ["📸 <b>Печать фотографий на фотобумаге</b>\n\nТарифы:"]
+        if p:
+            for item in p:
+                if is_promo_active(item):
+                    try:
+                        d_fmt = datetime.strptime(item['promo_until'], "%Y-%m-%d").strftime("%d.%m")
+                    except Exception:
+                        d_fmt = item['promo_until']
+                    lines.append(f"• {html.escape(item['name'])}: 🔥 <b>АКЦИЯ до {d_fmt}: {item['promo_price']} ₽</b> <s>(вместо {item['price']} ₽)</s>")
+                else:
+                    lines.append(f"• {html.escape(item['name'])}: <b>{item['price']} ₽</b> (от {item['bulk_threshold']} шт: <b>{item['bulk_price']} ₽</b>)")
         else:
-            lines.append(f"• {html.escape(item['name'])}: <b>{item['price']} ₽</b> (от {item['bulk_threshold']} шт: <b>{item['bulk_price']} ₽</b>)")
+            lines.append("• Фото 10х15: <b>25.0 ₽</b> (от 100 шт: <b>18.0 ₽</b>)")
+            lines.append("• Фото 15х20: <b>50.0 ₽</b> (от 100 шт: <b>40.0 ₽</b>)")
+            lines.append("• Фото 20х30: <b>100.0 ₽</b> (от 100 шт: <b>80.0 ₽</b>)")
 
-    lines.append("\nВыберите желаемый размер:")
-    await message.answer("\n".join(lines), reply_markup=get_photo_sizes_kb(), parse_mode="HTML")
+        lines.append("\nВыберите желаемый размер:")
+        await message.answer("\n".join(lines), reply_markup=get_photo_sizes_kb(), parse_mode="HTML")
+    except Exception as e:
+        logger.exception(f"Error in choose_photo_size: {e}")
+        await message.answer("📸 <b>Печать фотографий на фотобумаге</b>\n\nВыберите желаемый размер:", reply_markup=get_photo_sizes_kb(), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("photo_size:"))
 async def start_photo_upload(callback: CallbackQuery, state: FSMContext):
@@ -152,21 +188,31 @@ async def start_photo_upload(callback: CallbackQuery, state: FSMContext):
 
 # Печать документов
 async def choose_doc_format(message: Message):
-    prices = await get_all_prices()
-    p = {x['service_code']: x for x in prices if 'doc_a' in x['service_code']}
-    lines = ["📄 <b>Печать документов (PDF, сканы, фото)</b>\n\nТарифы:"]
-    for code, item in p.items():
-        if is_promo_active(item):
-            try:
-                d_fmt = datetime.strptime(item['promo_until'], "%Y-%m-%d").strftime("%d.%m")
-            except Exception:
-                d_fmt = item['promo_until']
-            lines.append(f"• {html.escape(item['name'])}: 🔥 <b>АКЦИЯ до {d_fmt}: {item['promo_price']} ₽</b> <s>(вместо {item['price']} ₽)</s>")
+    try:
+        prices = await get_all_prices()
+        p = [x for x in prices if x.get('service_code', '').startswith('doc_a')]
+        lines = ["📄 <b>Печать документов (PDF, сканы, фото)</b>\n\nТарифы:"]
+        if p:
+            for item in p:
+                if is_promo_active(item):
+                    try:
+                        d_fmt = datetime.strptime(item['promo_until'], "%Y-%m-%d").strftime("%d.%m")
+                    except Exception:
+                        d_fmt = item['promo_until']
+                    lines.append(f"• {html.escape(item['name'])}: 🔥 <b>АКЦИЯ до {d_fmt}: {item['promo_price']} ₽</b> <s>(вместо {item['price']} ₽)</s>")
+                else:
+                    lines.append(f"• {html.escape(item['name'])}: <b>{item['price']} ₽</b>")
         else:
-            lines.append(f"• {html.escape(item['name'])}: <b>{item['price']} ₽</b>")
+            lines.append("• Документ А4 (Ч/Б): <b>10.0 ₽</b>")
+            lines.append("• Документ А4 (Цвет): <b>35.0 ₽</b>")
+            lines.append("• Документ А3 (Ч/Б): <b>25.0 ₽</b>")
+            lines.append("• Документ А3 (Цвет): <b>70.0 ₽</b>")
 
-    lines.append("\nВыберите формат:")
-    await message.answer("\n".join(lines), reply_markup=get_doc_format_kb(), parse_mode="HTML")
+        lines.append("\nВыберите формат:")
+        await message.answer("\n".join(lines), reply_markup=get_doc_format_kb(), parse_mode="HTML")
+    except Exception as e:
+        logger.exception(f"Error in choose_doc_format: {e}")
+        await message.answer("📄 <b>Печать документов</b>\n\nВыберите формат:", reply_markup=get_doc_format_kb(), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("doc_fmt:"))
 async def start_doc_upload(callback: CallbackQuery, state: FSMContext):
