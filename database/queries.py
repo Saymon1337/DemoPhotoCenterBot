@@ -5,7 +5,8 @@ import pytz
 from config import TIMEZONE
 from database.db import DB_NAME
 
-# --- CMS: Настройки и тексты ---
+# --- CMS: Настройки, тексты и История кнопок (Alias History) ---
+
 async def get_text(key: str, default: str = "") -> str:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
@@ -13,11 +14,50 @@ async def get_text(key: str, default: str = "") -> str:
             return row[0] if row else default
 
 async def set_text(key: str, value: str):
+    """Сохраняет новый текст и автоматически архивирует старое название в историю."""
+    old_value = await get_text(key)
     async with aiosqlite.connect(DB_NAME) as db:
+        # Создаем таблицу истории названий кнопок, если ее еще нет
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS button_history (
+                btn_key TEXT,
+                old_text TEXT,
+                PRIMARY KEY (btn_key, old_text)
+            )
+        """)
+        # Если было старое название и оно изменилось — сохраняем в историю
+        if old_value and old_value != value and key.startswith("btn_"):
+            await db.execute("INSERT OR IGNORE INTO button_history (btn_key, old_text) VALUES (?, ?)", (key, old_value))
+            
         await db.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
         await db.commit()
 
-# --- Пользователи ---
+async def get_button_aliases(key: str, default: str = "") -> list[str]:
+    """Возвращает текущее название кнопки + ВСЕ ее исторические названия."""
+    aliases = set()
+    current = await get_text(key, default)
+    if current:
+        aliases.add(current)
+    if default:
+        aliases.add(default)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS button_history (
+                btn_key TEXT,
+                old_text TEXT,
+                PRIMARY KEY (btn_key, old_text)
+            )
+        """)
+        async with db.execute("SELECT old_text FROM button_history WHERE btn_key = ?", (key,)) as cursor:
+            rows = await cursor.fetchall()
+            for r in rows:
+                if r[0]:
+                    aliases.add(r[0])
+    return list(aliases)
+
+# --- Пользователи и Профиль ---
+
 async def add_or_update_user(tg_id: int, username: str, full_name: str, default_role: str = 'client'):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -64,7 +104,8 @@ async def get_all_users_by_target(target: str) -> list[int]:
         async with db.execute(q) as cursor:
             return [r[0] for r in await cursor.fetchall()]
 
-# --- Цены и Акции с дедлайнами ---
+# --- Цены и Акции ---
+
 async def get_all_prices():
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
@@ -78,7 +119,6 @@ async def get_price(service_code: str):
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-# Проверка, действует ли акция сегодня
 def is_promo_active(item: dict) -> bool:
     if not item.get('promo_price') or not item.get('promo_until'):
         return False
@@ -104,6 +144,7 @@ async def update_standard_price(service_code: str, new_price: float, bulk_price:
         await db.commit()
 
 # --- Бронирование слотов ---
+
 async def get_booked_slots(date_str: str) -> list[str]:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT booking_time FROM bookings WHERE booking_date = ? AND status = 'booked'", (date_str,)) as cursor:
@@ -142,6 +183,7 @@ async def toggle_block_slot(date_str: str, time_slot: str) -> bool:
             return True
 
 # --- Заказы ---
+
 async def create_order(client_id: int, client_name: str, client_phone: str, total_amount: float, comment: str = '') -> tuple[int, str]:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT MAX(id) FROM orders") as cursor:
