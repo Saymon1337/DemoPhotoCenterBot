@@ -40,7 +40,7 @@ async def get_current_cms_texts() -> dict:
     keys = ['btn_photo', 'btn_docs', 'btn_booking', 'btn_cart', 'btn_my_orders', 'msg_welcome', 'msg_broadcast_title']
     return {k: await get_text(k) for k in keys}
 
-# Старт
+# Старт бота
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     try:
@@ -50,6 +50,7 @@ async def cmd_start(message: Message, state: FSMContext):
         role = await get_user_role(uid)
         is_owner = (uid == OWNER_ID or role == 'owner')
 
+        # Служебный кабинет персонала
         if is_owner or role == 'staff':
             safe_name = html.escape(message.from_user.first_name or "Коллега")
             role_label = "Владелец" if is_owner else "Сотрудник"
@@ -61,6 +62,7 @@ async def cmd_start(message: Message, state: FSMContext):
             await message.answer("🛠 <b>Панель управления фотоцентра</b>\nВыберите действие:", reply_markup=kb, parse_mode="HTML")
             return
 
+        # Клиентское меню со свежими кнопками из БД
         cms = await get_current_cms_texts()
         safe_name = html.escape(message.from_user.first_name or "Гость")
         welcome_text = cms.get('msg_welcome') or 'Добро пожаловать в цифровой фотоцентр! Выберите нужную услугу:'
@@ -69,62 +71,47 @@ async def cmd_start(message: Message, state: FSMContext):
         logger.exception(f"Ошибка в cmd_start: {e}")
         await message.answer(f"❌ Ошибка запуска: {e}")
 
-# САМОИСЦЕЛЯЮЩИЙСЯ РОУТЕР КНОПОК МЕНЮ
+# ЧЕТКИЙ РОУТЕР КНОПОК МЕНЮ (СТРОГО ТОЧНОЕ СОВПАДЕНИЕ С АРХИВОМ И ТЕКУЩИМИ НАЗВАНИЯМИ)
 @router.message(StateFilter(None), F.text)
 async def dynamic_client_menu_router(message: Message, state: FSMContext):
     txt = message.text.strip()
-    txt_lower = txt.lower()
 
     # 0. Служебная кнопка админов
-    if txt == "🛠 Панель управления" or "панель управления" in txt_lower:
+    if txt == "🛠 Панель управления":
         from handlers.admin import cmd_admin
         await cmd_admin(message)
         return
 
-    cms = await get_current_cms_texts()
-
-    # Получаем ВСЮ ИСТОРИЮ названий для каждой кнопки (текущие + прошлые изменения)
+    # Загружаем текущие и все архивные названия из таблицы button_history
+    booking_aliases = await get_button_aliases('btn_booking', default="📅 Запись на фото на документы")
     photo_aliases = await get_button_aliases('btn_photo', default="📸 Печать фотографий")
     docs_aliases = await get_button_aliases('btn_docs', default="📄 Печать документов")
-    booking_aliases = await get_button_aliases('btn_booking', default="📅 Запись на фото на документы")
     cart_aliases = await get_button_aliases('btn_cart', default="🛒 Мой заказ / Корзина")
     orders_aliases = await get_button_aliases('btn_my_orders', default="📋 Мои записи и заказы")
 
-    # Функция автообновления кнопок на экране клиента, если нажата старая кнопка
-    async def refresh_keyboard_if_outdated(current_btn_key: str):
-        current_name = cms.get(current_btn_key)
-        if current_name and txt != current_name:
-            # На лету обновляем клавиатуру на телефоне клиента на актуальную из CMS!
-            await message.answer("🔄 <i>Меню обновлено до актуального состояния.</i>", reply_markup=get_main_menu_kb(cms), parse_mode="HTML")
-
-    # 1. Фотопечать (сработает при ЛЮБОМ старом или новом названии кнопки)
-    if txt in photo_aliases or any(a.lower() == txt_lower for a in photo_aliases) or "фото" in txt_lower:
-        await refresh_keyboard_if_outdated('btn_photo')
-        await choose_photo_size(message)
-        return
-
-    # 2. Печать документов
-    if txt in docs_aliases or any(a.lower() == txt_lower for a in docs_aliases) or "документ" in txt_lower:
-        await refresh_keyboard_if_outdated('btn_docs')
-        await choose_doc_format(message)
-        return
-
-    # 3. Запись на фото
-    if txt in booking_aliases or any(a.lower() == txt_lower for a in booking_aliases) or "запись" in txt_lower:
-        await refresh_keyboard_if_outdated('btn_booking')
+    # 1. Запись на фото на документы (проверяем первой, строго точное совпадение)
+    if txt in booking_aliases:
         from handlers.booking import start_booking
         await start_booking(message)
         return
 
-    # 4. Корзина
-    if txt in cart_aliases or any(a.lower() == txt_lower for a in cart_aliases) or "корзин" in txt_lower or (txt_lower.startswith("заказ") and "мои" not in txt_lower):
-        await refresh_keyboard_if_outdated('btn_cart')
+    # 2. Печать фото (строго точное совпадение с текущим или архивными именами)
+    if txt in photo_aliases:
+        await choose_photo_size(message)
+        return
+
+    # 3. Печать документов (строго точное совпадение)
+    if txt in docs_aliases:
+        await choose_doc_format(message)
+        return
+
+    # 4. Корзина (строго точное совпадение)
+    if txt in cart_aliases:
         await view_cart_cmd(message, state)
         return
 
-    # 5. Мои заказы
-    if txt in orders_aliases or any(a.lower() == txt_lower for a in orders_aliases) or "мои записи" in txt_lower or "мои заказы" in txt_lower:
-        await refresh_keyboard_if_outdated('btn_my_orders')
+    # 5. Мои записи и заказы (строго точное совпадение)
+    if txt in orders_aliases:
         from handlers.booking import view_client_bookings_and_orders
         await view_client_bookings_and_orders(message)
         return
@@ -296,7 +283,7 @@ async def finish_upload(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
 
-# Калькулятор корзины
+# Калькулятор суммы
 async def calculate_cart_total(cart: list) -> float:
     total = 0.0
     for it in cart:
